@@ -1,20 +1,39 @@
 #!/bin/bash
 
 ###############################################################################
-# GCP enumeration script by the GitLab Red Team.
+# GCP enumeration script by the GitLab Red Team (improved version).
 
 # This script is meant to run from a Linux Google Compute Instance. All
 # commands are passive, and will generate miscellaneous text files in the
 # `out-gcp-enum` folder in the current working directory.
 
-# Just run the script. Provide a "-d" argument to debug stderr.
+# Provide a "-d" argument to debug stderr. Logs are saved in "enum.log".
+# Use "-p" to enable parallel execution of some tasks.
 ###############################################################################
 
 OUTDIR="out-gcp-enum-$(date -u +'%Y-%m-%d-%H-%M-%S')"
 META="http://metadata.google.internal"
-DEBUG="$1"
+DEBUG=false
+PARALLEL=false
+LOGFILE="enum.log"
 
-# We want a unique output dir, to avoid overwriting anything
+# Parse command-line arguments
+while getopts ":dp" opt; do
+  case $opt in
+    d)
+      DEBUG=true
+      ;;
+    p)
+      PARALLEL=true
+      ;;
+    *)
+      echo "Usage: $0 [-d] [-p]"
+      exit 1
+      ;;
+  esac
+done
+
+# Create output directory
 if [[ ! -d "$OUTDIR" ]]; then
     mkdir "$OUTDIR"
     echo "[*] Created folder '$OUTDIR' for output"
@@ -23,142 +42,75 @@ else
     exit 1
 fi
 
-# This function will help standardize running a command, appending to a log
-# file, and reporting on whether or not it completed successfully
-function run_cmd () {
-    # Syntaxt will be: run_cmd "[COMMAND]" "[LOGFILE]"
+# Standard function for running commands
+echo "[*] Starting GCP Enumeration" > "$LOGFILE"
+function run_cmd() {
     command="$1"
-    outfile="$OUTDIR"/"$2"
+    outfile="$OUTDIR/$2"
+    description="$3"
 
-    # If script is run with '-d' as the first argument, stderr will be shown.
-    # Otherwise, we just assume stderr is a permission thing and give a generic
-    # failure message.
-    if [[ "$DEBUG" == "-d" ]]; then
-        /bin/bash -c "$command" >> "$outfile"
+    echo "[*] $description" | tee -a "$LOGFILE"
+
+    # Execute the command, managing stderr based on the DEBUG flag
+    if $DEBUG; then
+        /bin/bash -c "$command" >> "$outfile" 2>> "$LOGFILE"
     else
         /bin/bash -c "$command" >> "$outfile" 2>/dev/null
     fi
 
-    # Not providing robust error messages
+    # Provide feedback on command success/failure
     if [ $? -eq 0 ]; then
-        echo "  [+] SUCCESS"
+        echo "  [+] SUCCESS" | tee -a "$LOGFILE"
     else
-        echo "  [!] FAIL"
+        echo "  [!] FAIL" | tee -a "$LOGFILE"
     fi
 }
 
-# From here on the syntax is:
-#  run_cmd "[COMMAND]" "[LOGFILE]"
+# General enumeration commands
+declare -A ENUM_COMMANDS
+ENUM_COMMANDS=(
+    ["gcloud-info.txt"]="gcloud info --quiet"
+    ["gcloud-config.txt"]="gcloud config list --quiet"
+    ["metadata.txt"]="curl '$META/computeMetadata/v1/?recursive=true&alt=text' -H 'Metadata-Flavor: Google'"
+    ["compute-instances.json"]="gcloud compute instances list --quiet --format=json"
+    ["firewall.json"]="gcloud compute firewall-rules list --quiet --format=json"
+    ["subnets.json"]="gcloud compute networks subnets list --quiet --format=json"
+    ["service-accounts.json"]="gcloud iam service-accounts list --quiet --format=json"
+    ["projects.json"]="gcloud projects list --quiet --format=json"
+    ["compute-templates.json"]="gcloud compute instance-templates list --quiet --format=json"
+    ["compute-images.json"]="gcloud compute images list --no-standard-images --quiet --format=json"
+    ["cloud-functions.json"]="gcloud functions list --quiet --format=json"
+    ["pubsub.json"]="gcloud pubsub subscriptions list --quiet --format=json"
+    ["backend-services.json"]="gcloud compute backend-services list --quiet --format=json"
+    ["ai-platform.json"]="gcloud ai-platform models list --quiet --format=json && gcloud ai-platform jobs list --quiet --format=json"
+    ["cloud-run-managed.json"]="gcloud run services list --platform=managed --quiet --format=json"
+    ["cloud-run-gke.json"]="gcloud run services list --platform=gke --quiet --format=json"
+    ["cloud-sql-instances.json"]="gcloud sql instances list --quiet --format=json"
+    ["cloud-spanner-instances.json"]="gcloud spanner instances list --quiet --format=json"
+    ["cloud-bigtable.json"]="gcloud bigtable instances list --quiet --format=json"
+    ["cloud-filestore.json"]="gcloud filestore instances list --quiet --format=json"
+    ["logging-folders.json"]="gcloud logging logs list --quiet --format=json"
+    ["k8s-clusters.json"]="gcloud container clusters list --quiet --format=json"
+    ["k8s-images.json"]="gcloud container images list --quiet --format=json"
+    ["buckets.txt"]="gsutil ls -L"
+    ["kms.txt"]="gcloud kms keyrings list --location global --quiet"
+)
 
-echo "[*] Analyzing gcloud configuration"
-run_cmd "gcloud info --quiet" "gcloud-info.txt"
-run_cmd "gcloud config list --quiet" "gcloud-info.txt"
-run_cmd "gcloud auth list --quiet" "gcloud-info.txt"
-
-echo "[*] Scraping metadata server"
-url="$META/computeMetadata/v1/?recursive=true&alt=text"
-run_cmd "curl '$url' -H 'Metadata-Flavor: Google'" "metadata.txt"
-
-echo "[*] Exporting detailed compute instance info"
-run_cmd "gcloud compute instances list --quiet --format=json" "compute-instances.json"
-
-echo "[*] Exporting detailed firewall info"
-run_cmd "gcloud compute firewall-rules list --quiet --format=json" "firewall.json"
-
-echo "[*] Exporting detailed subnets info"
-run_cmd "gcloud compute networks subnets list --quiet --format=json" "subnets.json"
-
-echo "[*] Exporting detailed service account info"
-run_cmd "gcloud iam service-accounts list --quiet --format=json" "service-accounts.json"
-
-echo "[*] Exporting detailed service account key info"
-for i in $(gcloud iam service-accounts list --format="table[no-heading](email)"); do
-    run_cmd "gcloud iam service-accounts keys list --quiet --iam-account $i --quiet --format=json" \
-        "service-account-keys.json"
+# Execute enumeration commands
+echo "[*] Executing enumeration commands"
+for outfile in "${!ENUM_COMMANDS[@]}"; do
+    command="${ENUM_COMMANDS[$outfile]}"
+    description="Exporting $(basename "$outfile" .json) info"
+    if $PARALLEL; then
+        run_cmd "$command" "$outfile" "$description" &
+    else
+        run_cmd "$command" "$outfile" "$description"
+    fi
 done
 
-echo "[*] Exporting detailed project IAM info"
-url="$META/computeMetadata/v1/project/project-id"
-prj=$(curl $url -H "Metadata-Flavor: Google" -s)
-run_cmd "gcloud projects get-iam-policy $prj --quiet --format=json" "iam-policy-project.json"
+# Wait for background tasks to complete if in parallel mode
+if $PARALLEL; then
+    wait
+fi
 
-echo "[*] Exporting detailed organization IAM info"
-for i in $(gcloud organizations list | awk '{print $2}' | tail -n +2); do
-    run_cmd "gcloud organizations get-iam-policy $i --quiet" "iam-policy-org-$i.json"
-done
-
-echo "[*] Exporting detailed available project info"
-run_cmd "gcloud projects list --quiet --format=json" "projects.json"
-
-echo "[*] Exporting detailed instance template info"
-run_cmd "gcloud compute instance-templates list --quiet --format=json" "compute-templates.json"
-
-echo "[*] Exporting detailed custom image info"
-run_cmd "gcloud compute images list --no-standard-images --quiet --format=json" "compute-images.json"
-
-echo "[*] Exporting detailed Cloud Functions info"
-run_cmd "gcloud functions list --quiet --format=json" "cloud-functions.json"
-
-echo "[*] Exporting detailed Pub/Sub info"
-run_cmd "gcloud pubsub subscriptions list --quiet --format=json" "pubsub.json"
-
-echo "[*] Exporting detailed compute backend info"
-run_cmd "gcloud compute backend-services list --quiet --format=json" "backend-services.json"
-
-echo "[*] Exporting detailed cloud run info"
-run_cmd "gcloud compute backend-services list --quiet --format=json" "backend-services.json"
-
-echo "[*] Exporting detailed AI platform info"
-run_cmd "gcloud ai-platform models list --quiet --format=json" "ai-platform.json"
-run_cmd "gcloud ai-platform jobs list --quiet --format=json" "ai-platform.json"
-
-echo "[*] Exporting detailed Cloud Source Repository info"
-run_cmd "gcloud run services list --platform=managed --quiet --format=json" "cloud-run-managed.json"
-run_cmd "gcloud run services list --platform=gke --quiet --format=json" "cloud-run-gke.json"
-
-echo "[*] Exporting detailed Cloud SQL info"
-run_cmd "gcloud sql instances list --quiet --format=json" "cloud-sql-instances.json"
-for i in $(gcloud sql instances list --quiet | awk '{print $1}' | tail -n +2); do
-    run_cmd "gcloud sql databases list --instance $i --quiet" "cloud-sql-databases.txt"
-done
-
-echo "[*] Exporting detailed Cloud Spanner info"
-run_cmd "gcloud spanner instances list --quiet --format=json" "cloud-spanner-instances.json"
-for i in $(gcloud spanner instances list --quiet | awk '{print $1}' | tail -n +2); do
-    run_cmd "gcloud spanner databases list --quiet --instance $i" "cloud-spanner-databases.txt"
-done
-
-echo "[*] Exporting detailed Cloud Bigtable info"
-run_cmd "gcloud bigtable instances list --quiet --format=json" "cloud-bigtable.json"
-
-echo "[*] Exporting detailed Cloud Filestore info"
-run_cmd "gcloud filestore instances list --quiet --format=json" "cloud-filestore.json"
-
-echo "[*] Exporting Stackdriver logging info"
-run_cmd "gcloud logging logs list --quiet --format json" "logging-folders.json"
-for i in $(gcloud logging logs list --quiet --format="table[no-heading](.)"); do
-    echo Looking for logs in $i:
-    short=$(echo "$i" | tr "/" ".")
-    run_cmd "gcloud logging read $i --quiet --format=json" "logging-$short.json"
-done
-echo "[+] All done, good luck!"
-
-echo "[*] Exporting Kubernetes info"
-run_cmd "gcloud container clusters list --quiet --format json" "k8s-clusters.json"
-run_cmd "gcloud container images list --quiet --format json" "k8s-images.json"
-
-echo "[*] Enumerating storage buckets"
-run_cmd "gsutil ls" "buckets.txt"
-run_cmd "gsutil ls -L" "buckets.txt"
-for i in $(gsutil ls); do
-    run_cmd "gsutil ls $i" "buckets.txt"
-done
-
-echo "[*] Enumerating crypto keys"
-run_cmd "gcloud kms keyrings list --location global --quiet" "kms.txt"
-for i in $(gcloud kms keyrings list --location global --quiet); do
-    run_cmd "gcloud kms keys list --keyring $i --location global --quiet" "kms.txt"
-done
-
-echo "[+] All done, good luck!"
-
+echo "[+] All done, good luck!" | tee -a "$LOGFILE"
